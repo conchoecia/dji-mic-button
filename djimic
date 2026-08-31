@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+"""
+djimic - identify the button on a DJI wireless mic and bind it to a macOS
+hotkey via Karabiner-Elements.
+
+The mic's button is not a keyboard key. It arrives as a USB HID *consumer
+control* usage from the receiver, and which usage it sends is not documented
+anywhere. This tool reads the receiver's HID report descriptor to find every
+usage it is physically capable of sending, then identifies the real one by
+temporarily mapping each candidate to a distinct word and letting you press
+the button. Finally it writes a device-scoped Karabiner rule so the button
+fires the hotkey of your choice.
+
+Subcommands: detect, probe, install, doctor, uninstall, restore
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+DJI_VENDOR_ID = 11427  # 0x2CA3
+CONSUMER_PAGE = 0x0C
+RULE_TAG = "djimic"
+
+KARABINER_JSON = os.path.expanduser("~/.config/karabiner/karabiner.json")
+KARABINER_CLI = ("/Library/Application Support/org.pqrs/Karabiner-Elements"
+                 "/bin/karabiner_cli")
+KARABINER_LOG = "/var/log/karabiner/core_service.log"
+
+# Consumer usages that Karabiner accepts by name. Anything else must be given
+# as a raw integer -- notably 0xB1 (pause) and 0xB7 (stop), whose names appear
+# inside the Karabiner binary but are rejected by the config parser.
+CONSUMER_KEY_NAMES = {
+    0xB3: "fast_forward",        0xB4: "rewind",
+    0xB5: "scan_next_track",     0xB6: "scan_previous_track",
+    0xB8: "eject",               0xCD: "play_or_pause",
+    0xE2: "mute",                0xE9: "volume_increment",
+    0xEA: "volume_decrement",
+}
+
+# Short, distinct, all-lowercase words the probe types for each candidate.
+PROBE_WORDS = {
+    0xB1: "paus", 0xB3: "ffwd", 0xB4: "rewd", 0xB5: "next",
+    0xB6: "prev", 0xB7: "stop", 0xB8: "ejct", 0xCD: "play",
+    0xE2: "mute", 0xE9: "volup", 0xEA: "voldn",
+}
+
+USAGE_LABELS = {
+    0xB1: "pause", 0xB3: "fast forward", 0xB4: "rewind",
+    0xB5: "scan next track", 0xB6: "scan previous track",
+    0xB7: "stop", 0xB8: "eject", 0xCD: "play/pause",
+    0xE2: "mute", 0xE9: "volume increment", 0xEA: "volume decrement",
+}
+
+MOD_ALIASES = {
+    "fn": "fn",
+    "cmd": "left_command", "command": "left_command",
+    "opt": "left_option", "option": "left_option", "alt": "left_option",
+    "ctrl": "left_control", "control": "left_control",
+    "shift": "left_shift",
+}
+KEY_ALIASES = {
+    "space": "spacebar", "tilde": "grave_accent_and_tilde",
+    "grave": "grave_accent_and_tilde", "esc": "escape",
+    "enter": "return_or_enter", "ret": "return_or_enter",
+}
+
+OK, BAD, WARN = "  ok  ", " FAIL ", " warn "
+
+
+def say(mark, msg):
+    print(f"[{mark}] {msg}")
+
+
+# --------------------------------------------------------------------------
+# device discovery
+# --------------------------------------------------------------------------
+
+def find_receivers():
+    """Every DJI HID device currently attached, with its report descriptor."""
+    try:
+        dump = subprocess.run(["ioreg", "-c", "IOHIDDevice", "-r", "-w0", "-l"],
+                              capture_output=True, text=True).stdout
+    except OSError:
+        return []
+
+    blocks, cur = [], []
+    for line in dump.splitlines():
+        if "+-o " in line:
+            if cur:
+                blocks.append("\n".join(cur))
+            cur = [line]
+        elif cur:
+            cur.append(line)
+    if cur:
+        blocks.append("\n".join(cur))
+
+    best = {}
+    for b in blocks:
+        vid = re.search(r'"VendorID"\s*=\s*(\d+)', b)
+        pid = re.search(r'"ProductID"\s*=\s*(\d+)', b)
+        if not vid or not pid or int(vid.group(1)) != DJI_VENDOR_ID:
+            continue
+        name = re.search(r'"Product"\s*=\s*"([^"]*)"', b)
+        desc = re.search(r'"ReportDescriptor"\s*=\s*<([0-9a-fA-F]*)>', b)
+        dev = {
+            "vendor_id": DJI_VENDOR_ID,
+            "product_id": int(pid.group(1)),
+            "name": name.group(1) if name else "(unnamed)",
+            "descriptor": desc.group(1) if desc else "",
+        }
+        key = dev["product_id"]
+        if key not in best or (not best[key]["descriptor"] and dev["descriptor"]):
+            best[key] = dev
+    return list(best.values())
+
+
+def parse_descriptor(hexstr):
+    """Return [(usage_page, usage)] for every non-constant variable Input."""
+    try:
+        data = bytes.fromhex(hexstr)
+    except ValueError:
+        return []
+
+    out, pending, page, i = [], [], None, 0
+    while i < len(data):
+        head = data[i]
+        i += 1
+        size = head & 0x03
+        size = 4 if size == 3 else size
+        val = int.from_bytes(data[i:i + size], "little") if size else 0
+        i += size
+        item = head & 0xFC
+
+        if item == 0x04:            # Usage Page (global)
+            page = val
+        elif item == 0x08:          # Usage (local)
+            if size == 4:           # fully-qualified page|usage
+                pending.append((val >> 16, val & 0xFFFF))
+            else:
+                pending.append((page, val))
+        elif item == 0x80:          # Input (main)
+            constant, variable = val & 0x01, val & 0x02
+            if variable and not constant:
+                out.extend(pending)
+            pending = []
+        elif item in (0x90, 0xB0, 0xA0, 0xC0):   # Output/Feature/Collection/End
+            pending = []
+    return out
+
+
+def consumer_candidates(dev):
+    """Consumer-page usages this device can send, in descriptor order."""
+    seen, out = set(), []
+    for page, usage in parse_descriptor(dev["descriptor"]):
+        if page == CONSUMER_PAGE and usage not in seen:
+            seen.add(usage)
+            out.append(usage)
+    return out
+
+
+def pick_device(args):
+    devs = find_receivers()
+    if not devs:
+        say(BAD, "No DJI receiver found. Plug the receiver into a USB port.")
+        sys.exit(1)
+    if args.product_id:
+        devs = [d for d in devs if d["product_id"] == args.product_id]
+        if not devs:
+            say(BAD, f"No DJI device with product_id {args.product_id}.")
+            sys.exit(1)
+    if len(devs) > 1:
+        say(WARN, "Multiple DJI devices found; using the first with a descriptor.")
+    return devs[0]
+
+
+def label(usage):
+    return USAGE_LABELS.get(usage, f"usage 0x{usage:02X}")
+
+
+def karabiner_consumer(usage):
+    """Karabiner's name for a usage, or the raw integer if it has none."""
+    return CONSUMER_KEY_NAMES.get(usage, usage)
+
+
+# --------------------------------------------------------------------------
+# karabiner config
+# --------------------------------------------------------------------------
+
+def load_config(path):
+    if not os.path.exists(path):
+        say(BAD, f"No Karabiner config at {path}.")
+        say(WARN, "Install Karabiner-Elements and launch it once to create it.")
+        sys.exit(1)
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def backup_config(path):
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    dest = f"{path}.{RULE_TAG}-backup.{stamp}"
+    shutil.copy2(path, dest)
+    return dest
+
+
+def write_config(cfg, path):
+    with open(path, "w") as fh:
+        json.dump(cfg, fh, indent=4)
+        fh.write("\n")
+
+
+def lint_config(path):
+    if not os.path.exists(KARABINER_CLI):
+        return True, "karabiner_cli not present; lint skipped"
+    r = subprocess.run([KARABINER_CLI, "--lint-complex-modifications", path],
+                       capture_output=True, text=True)
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def log_errors_since(when, wait=2.0):
+    """Karabiner error lines written after `when` (it reloads on file change)."""
+    time.sleep(wait)
+    try:
+        with open(KARABINER_LOG, errors="replace") as fh:
+            lines = fh.read().splitlines()[-60:]
+    except OSError:
+        return []
+    hits = []
+    for line in lines:
+        if "[error]" not in line:
+            continue
+        m = re.match(r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", line)
+        if m and datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S") >= when:
+            hits.append(line)
+    return hits
+
+
+def same_device(entry, dev):
+    ident = entry.get("identifiers", {})
+    return (ident.get("vendor_id") == dev["vendor_id"]
+            and ident.get("product_id") == dev["product_id"])
+
+
+def rule_targets_device(rule, dev):
+    """True if any manipulator binds a button on `dev`.
+
+    Matching on the description alone is not enough: other installers (and
+    hand-written rules) bind this same device under their own names, and
+    leaving one in place makes the button fire two hotkeys at once.
+    """
+    if RULE_TAG in rule.get("description", ""):
+        return True
+    for man in rule.get("manipulators", []):
+        if "consumer_key_code" not in man.get("from", {}):
+            continue
+        for cond in man.get("conditions", []):
+            if cond.get("type") not in ("device_if", "device_unless"):
+                continue
+            for ident in cond.get("identifiers", []):
+                if (ident.get("vendor_id") == dev["vendor_id"]
+                        and ident.get("product_id") == dev["product_id"]):
+                    return True
+    return False
+
+
+def target_profiles(cfg, which):
+    if which == "current":
+        sel = [p for p in cfg["profiles"] if p.get("selected")]
+        return sel or cfg["profiles"][:1]
+    return cfg["profiles"]
+
+
+def apply_rule(cfg, rule, dev, which):
+    """Replace every rule bound to `dev` in the chosen profiles with `rule`.
+
+    Returns (profile_names, displaced) where `displaced` names any foreign
+    rule that was removed, so the caller can say so out loud.
+    """
+    names, displaced = [], []
+    for prof in target_profiles(cfg, which):
+        cm = prof.setdefault("complex_modifications", {})
+        kept = []
+        for r in cm.get("rules", []):
+            if rule_targets_device(r, dev):
+                desc = r.get("description", "(no description)")
+                if RULE_TAG not in desc:
+                    displaced.append(desc)
+            else:
+                kept.append(r)
+        cm["rules"] = kept + ([json.loads(json.dumps(rule))] if rule else [])
+
+        devs = [d for d in prof.get("devices", []) if not same_device(d, dev)]
+        if rule:
+            devs.append({
+                "identifiers": {"vendor_id": dev["vendor_id"],
+                                "product_id": dev["product_id"],
+                                "is_consumer": True},
+                "ignore": False,
+            })
+        prof["devices"] = devs
+        names.append(prof.get("name", "(unnamed)"))
+    return names, sorted(set(displaced))
+
+
+def commit(cfg, path, note):
+    """Write, lint, and confirm Karabiner accepted it. Rolls back on failure."""
+    backup = backup_config(path)
+    before = datetime.now().replace(microsecond=0)
+    write_config(cfg, path)
+
+    good, msg = lint_config(path)
+    if not good:
+        shutil.copy2(backup, path)
+        say(BAD, f"Config rejected by lint, rolled back:\n      {msg}")
+        sys.exit(1)
+
+    errs = log_errors_since(before)
+    if errs:
+        shutil.copy2(backup, path)
+        say(BAD, "Karabiner rejected the config, rolled back:")
+        for e in errs:
+            print(f"      {e}")
+        sys.exit(1)
+
+    say(OK, f"{note}  (backup: {os.path.basename(backup)})")
+    return backup
+
+
+# --------------------------------------------------------------------------
+# hotkeys
+# --------------------------------------------------------------------------
+
+def parse_hotkey(spec):
+    parts = [p.strip().lower() for p in spec.split("+") if p.strip()]
+    if not parts:
+        raise ValueError("empty hotkey")
+    key = KEY_ALIASES.get(parts[-1], parts[-1])
+    mods = [MOD_ALIASES.get(m, m) for m in parts[:-1]]
+    ev = {"key_code": key}
+    if mods:
+        ev["modifiers"] = mods
+    return ev
+
+
+def typed(word):
+    return [{"key_code": ch} for ch in word] + [{"key_code": "spacebar"}]
+
+
+def build_rule(dev, usage, hotkey_spec):
+    return {
+        "description": (f"DJI mic button ({label(usage)}) -> {hotkey_spec}"
+                        f"  [{RULE_TAG}]"),
+        "manipulators": [{
+            "type": "basic",
+            "conditions": [{
+                "type": "device_if",
+                "identifiers": [{"vendor_id": dev["vendor_id"],
+                                 "product_id": dev["product_id"]}],
+            }],
+            "from": {"consumer_key_code": karabiner_consumer(usage),
+                     "modifiers": {"optional": ["any"]}},
+            "to": [parse_hotkey(hotkey_spec)],
+        }],
+    }
+
+
+def build_probe_rule(dev, candidates):
+    mans, words = [], {}
+    for idx, usage in enumerate(candidates):
+        word = PROBE_WORDS.get(usage, f"key{idx}")
+        words[word] = usage
+        mans.append({
+            "type": "basic",
+            "conditions": [{
+                "type": "device_if",
+                "identifiers": [{"vendor_id": dev["vendor_id"],
+                                 "product_id": dev["product_id"]}],
+            }],
+            "from": {"consumer_key_code": karabiner_consumer(usage),
+                     "modifiers": {"optional": ["any"]}},
+            "to": typed(word),
+        })
+    rule = {"description": f"DJI button probe (temporary)  [{RULE_TAG}]",
+            "manipulators": mans}
+    return rule, words
+
+
+# --------------------------------------------------------------------------
+# subcommands
+# --------------------------------------------------------------------------
+
+def cmd_detect(args):
+    devs = find_receivers()
+    if not devs:
+        say(BAD, "No DJI device found. Plug in the receiver.")
+        return 1
+    for dev in devs:
+        say(OK, f"{dev['name']}  vendor_id={dev['vendor_id']} "
+                f"product_id={dev['product_id']}")
+        cands = consumer_candidates(dev)
+        if not cands:
+            say(WARN, "  no consumer-page usages in its report descriptor")
+            continue
+        print(f"      {len(cands)} button usage(s) this device can send:")
+        for u in cands:
+            kc = karabiner_consumer(u)
+            shown = f'"{kc}"' if isinstance(kc, str) else f"{kc} (numeric)"
+            print(f"        0x{u:02X}  {label(u):<22} karabiner: {shown}")
+        print("\n      Exactly one of these is the button. Run:  djimic probe")
+    return 0
+
+
+def cmd_probe(args, dev=None, cfg_path=None):
+    """Temporarily map every candidate to a distinct word, then read it back."""
+    path = cfg_path or args.config
+    dev = dev or pick_device(args)
+    cands = consumer_candidates(dev)
+    if not cands:
+        say(BAD, "That device advertises no consumer-page buttons.")
+        return None
+
+    cfg = load_config(path)
+    rule, words = build_probe_rule(dev, cands)
+    _, displaced = apply_rule(cfg, rule, dev, "all")
+    backup = commit(cfg, path, f"Probe armed for {len(cands)} candidate usages")
+
+    print()
+    print("  Keep this terminal focused, press the button on the MIC once,")
+    print("  then press Enter. A short word should type itself below.")
+    print()
+    answer = ""
+    try:
+        answer = input("  > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+    finally:
+        shutil.copy2(backup, path)
+        say(OK, "Probe removed, previous config restored")
+
+    token = answer.split()[0] if answer.split() else ""
+    if not token:
+        print()
+        say(BAD, "Nothing was typed.")
+        say(WARN, "The button may not emit HID at all (the receiver's own "
+                  "button does not), or Karabiner is not observing the device.")
+        say(WARN, "Check Karabiner-Elements > Settings > Devices for the receiver.")
+        return None
+    if token not in words:
+        print()
+        say(BAD, f"Unrecognized input {token!r} -- expected one of: "
+                 f"{', '.join(sorted(words))}")
+        return None
+
+    usage = words[token]
+    print()
+    say(OK, f"Button identified: {label(usage)}  (consumer usage 0x{usage:02X})")
+    return usage
+
+
+def cmd_install(args):
+    dev = pick_device(args)
+    usage = args.usage
+    if usage is None:
+        usage = cmd_probe(args, dev=dev)
+        if usage is None:
+            return 1
+        print()
+
+    cfg = load_config(args.config)
+    rule = build_rule(dev, usage, args.hotkey)
+    names, displaced = apply_rule(cfg, rule, dev, args.profiles)
+    for desc in displaced:
+        say(WARN, f"replaced an existing rule for this device: {desc}")
+    commit(cfg, args.config, f"Rule installed into profile(s): {', '.join(names)}")
+    say(OK, f"{label(usage)} on {dev['name']} now sends {args.hotkey}")
+    print()
+    print("  It appears in Karabiner-Elements under Settings > Complex")
+    print("  Modifications (never under Simple Modifications -- this rule is")
+    print("  scoped to one device, which simple modifications cannot express).")
+    print()
+    print(f"  Point your dictation app at {args.hotkey}, then press the mic button.")
+    return 0
+
+
+def cmd_doctor(args):
+    bad = 0
+
+    if os.path.exists("/Applications/Karabiner-Elements.app"):
+        say(OK, "Karabiner-Elements installed")
+    else:
+        say(BAD, "Karabiner-Elements not installed -> https://karabiner-elements.pqrs.org")
+        bad += 1
+
+    running = subprocess.run(["pgrep", "-f", "Karabiner-Core-Service"],
+                             capture_output=True).returncode == 0
+    say(OK if running else BAD,
+        "Karabiner core service running" if running else
+        "Karabiner core service not running (launch Karabiner-Elements once)")
+    bad += 0 if running else 1
+
+    devs = find_receivers()
+    if devs:
+        for d in devs:
+            say(OK, f"receiver present: {d['name']} "
+                    f"({d['vendor_id']}/{d['product_id']})")
+    else:
+        say(WARN, "no DJI receiver plugged in right now")
+
+    if os.path.exists(args.config):
+        cfg = load_config(args.config)
+        probe_dev = devs[0] if devs else {"vendor_id": DJI_VENDOR_ID,
+                                          "product_id": -1}
+        found = [(p.get("name"), r.get("description", "(no description)"))
+                 for p in cfg["profiles"]
+                 for r in p.get("complex_modifications", {}).get("rules", [])
+                 if rule_targets_device(r, probe_dev)]
+        if found:
+            for name, desc in found:
+                say(OK, f"rule in profile {name!r}: {desc}")
+            missing = len(cfg["profiles"]) - len(found)
+            if missing > 0:
+                say(WARN, f"{missing} profile(s) have no rule -- the button will "
+                          f"stop working if you switch to them "
+                          f"(fix: djimic install --profiles all)")
+        else:
+            say(BAD, "no djimic rule installed (run: djimic install)")
+            bad += 1
+    else:
+        say(BAD, f"no Karabiner config at {args.config}")
+        bad += 1
+
+    fn_use = subprocess.run(
+        ["defaults", "read", "com.apple.HIToolbox", "AppleFnUsageType"],
+        capture_output=True, text=True).stdout.strip()
+    meanings = {"0": "do nothing", "1": "change input source",
+                "2": "show emoji & symbols", "3": "start dictation"}
+    if fn_use in meanings:
+        note = f"fn key alone: {meanings[fn_use]}"
+        if fn_use == "3":
+            say(WARN, note + " -- may clash with an fn-based hotkey")
+        else:
+            say(OK, note)
+
+    print()
+    return 1 if bad else 0
+
+
+def cmd_uninstall(args):
+    cfg = load_config(args.config)
+    dev = {"vendor_id": DJI_VENDOR_ID,
+           "product_id": args.product_id or 0}
+    devs = find_receivers()
+    if devs and not args.product_id:
+        dev = devs[0]
+
+    present = any(rule_targets_device(r, dev)
+                  for p in cfg["profiles"]
+                  for r in p.get("complex_modifications", {}).get("rules", []))
+    if not present:
+        say(WARN, "No djimic rule found; nothing to remove.")
+        return 0
+
+    _, displaced = apply_rule(cfg, None, dev, "all")
+    for desc in displaced:
+        say(WARN, f"also removed: {desc}")
+    commit(cfg, args.config, "Rule removed from all profiles")
+    return 0
+
+
+def cmd_restore(args):
+    d = os.path.dirname(args.config) or "."
+    base = os.path.basename(args.config)
+    backups = sorted(f for f in os.listdir(d)
+                     if f.startswith(f"{base}.{RULE_TAG}-backup."))
+    if not backups:
+        say(BAD, "No djimic backups found.")
+        return 1
+    newest = os.path.join(d, backups[-1])
+    shutil.copy2(newest, args.config)
+    say(OK, f"Restored {backups[-1]}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+
+def usage_arg(text):
+    text = text.strip().lower()
+    for usage, name in CONSUMER_KEY_NAMES.items():
+        if text == name:
+            return usage
+    try:
+        return int(text, 16) if text.startswith("0x") else int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a consumer usage (try 0xE9 or volume_increment)")
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="djimic",
+        description="Bind a DJI wireless mic's button to a macOS hotkey.")
+    p.add_argument("--config", default=KARABINER_JSON,
+                   help="path to karabiner.json (default: %(default)s)")
+    p.add_argument("--product-id", type=int,
+                   help="pick a specific DJI device by USB product id")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("detect", help="list DJI devices and every usage they can send")
+    sub.add_parser("probe", help="identify the button by pressing it")
+
+    ins = sub.add_parser("install", help="bind the button to a hotkey")
+    ins.add_argument("--hotkey", default="fn+space",
+                     help="target hotkey, e.g. 'fn+space', 'ctrl+opt+cmd+d', "
+                          "'f13' (default: %(default)s)")
+    ins.add_argument("--usage", type=usage_arg,
+                     help="skip the probe and use this consumer usage")
+    ins.add_argument("--profiles", choices=("all", "current"), default="all",
+                     help="which Karabiner profiles to write to "
+                          "(default: %(default)s)")
+
+    sub.add_parser("doctor", help="check the setup end to end")
+    sub.add_parser("uninstall", help="remove the rule from every profile")
+    sub.add_parser("restore", help="restore the most recent djimic backup")
+
+    args = p.parse_args()
+    if sys.platform != "darwin":
+        say(BAD, "djimic only works on macOS.")
+        return 1
+
+    if args.cmd == "detect":
+        return cmd_detect(args)
+    if args.cmd == "probe":
+        return 0 if cmd_probe(args) is not None else 1
+    if args.cmd == "install":
+        return cmd_install(args)
+    if args.cmd == "doctor":
+        return cmd_doctor(args)
+    if args.cmd == "uninstall":
+        return cmd_uninstall(args)
+    if args.cmd == "restore":
+        return cmd_restore(args)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
