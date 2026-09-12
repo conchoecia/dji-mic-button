@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Break down how long each stage of a Handy dictation actually took.
+
+Usage:  handy-timing [N]        # last N runs (default 10)
+
+Reads Handy's log and reports, per dictation: transcription, LLM
+post-processing, and paste. Transcription and paste come from Handy's own
+measured durations; the LLM stage is derived from log timestamps, which have
+one-second resolution -- so treat it as +/- 1s, fine for telling 3s from 14s.
+
+Use it to compare post-processing providers: run a few dictations, switch
+provider in Handy, run a few more, and compare the LLM column.
+"""
+
+import os
+import re
+import sys
+from datetime import datetime
+
+LOG = os.path.expanduser("~/Library/Logs/com.pais.handy/handy.log")
+
+TS = r"\[(\d{4}-\d\d-\d\d)\]\[(\d\d:\d\d:\d\d)\]"
+PATS = {
+    "start":  re.compile(TS + r".*Recording started for binding (\S+)"),
+    "trans":  re.compile(TS + r".*Transcription completed in ([\d.]+)(ms|s): '(.*)"),
+    "llm_in": re.compile(TS + r".*Starting LLM post-processing with provider '([^']+)'"),
+    "llm_ok": re.compile(TS + r".*post-processing succeeded"),
+    "paste":  re.compile(TS + r".*Text pasted successfully in ([\d.]+)(ms|s|\u00b5s)"),
+}
+
+
+def when(m):
+    return datetime.strptime(m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M:%S")
+
+
+def secs(value, unit):
+    v = float(value)
+    return v / 1000.0 if unit == "ms" else v / 1e6 if unit.endswith("s") and unit != "s" else v
+
+
+def main():
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
+    try:
+        lines = open(LOG, errors="replace").read().splitlines()
+    except OSError as e:
+        print("cannot read %s: %s" % (LOG, e))
+        return 1
+
+    runs, cur = [], {}
+    for line in lines:
+        if (m := PATS["trans"].match(line)):
+            cur["t"] = secs(m.group(3), m.group(4))
+            cur["text"] = m.group(5).rstrip("'")
+            cur["at"] = when(m)
+        elif (m := PATS["llm_in"].match(line)):
+            cur["llm_start"], cur["provider"] = when(m), m.group(3)
+        elif (m := PATS["llm_ok"].match(line)) and "llm_start" in cur:
+            cur["llm"] = (when(m) - cur["llm_start"]).total_seconds()
+        elif (m := PATS["paste"].match(line)):
+            cur["p"] = secs(m.group(3), m.group(4))
+            if "t" in cur:
+                runs.append(cur)
+            cur = {}
+
+    runs = runs[-n:]
+    if not runs:
+        print("no complete dictations found in the log yet")
+        return 0
+
+    print("%-8s %7s %7s %7s %7s  %-18s %s"
+          % ("time", "trans", "llm", "paste", "TOTAL", "provider", "text"))
+    print("-" * 100)
+    tot = []
+    for r in runs:
+        llm = r.get("llm", 0.0)
+        total = r["t"] + llm + r["p"]
+        tot.append((r["t"], llm, r["p"], total))
+        print("%-8s %6.2fs %6.2fs %6.2fs %6.2fs  %-18s %s"
+              % (r["at"].strftime("%H:%M:%S"), r["t"], llm, r["p"], total,
+                 r.get("provider", "-")[:18], r["text"][:40]))
+
+    if len(tot) > 1:
+        k = len(tot)
+        print("-" * 100)
+        print("%-8s %6.2fs %6.2fs %6.2fs %6.2fs   <- mean of %d"
+              % ("mean", sum(x[0] for x in tot) / k, sum(x[1] for x in tot) / k,
+                 sum(x[2] for x in tot) / k, sum(x[3] for x in tot) / k, k))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
