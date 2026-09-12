@@ -34,6 +34,39 @@ setup. Then point your dictation app at the same hotkey.
 Requires macOS and [Karabiner-Elements](https://karabiner-elements.pqrs.org/).
 No other dependencies — it's one Python 3 file using only the standard library.
 
+## Which mics
+
+Measured on a [**DJI Mic Mini**](https://store.dji.com/product/dji-mic-mini) —
+receiver `Wireless Mic Rx`, vendor `11427` (`0x2CA3`), product `16401`
+(`0x4011`), transmitter button on consumer usage `0xE9`.
+
+| Model | Status |
+| --- | --- |
+| [DJI Mic Mini](https://store.dji.com/product/dji-mic-mini) | **measured**, button is `0xE9` |
+| DJI Mic Mini 2 | reports the same USB IDs, so the rule carries over |
+| [DJI Mic 2](https://www.dji.com/mic-2), [DJI Mic 3](https://www.dji.com/mic-3) | untested — run `djimic detect` |
+| Any other DJI receiver | detected automatically; probe it |
+| Non-DJI hardware | not detected (see below) |
+
+**The table is a convenience, not a requirement.** This tool exists precisely so
+you don't need a compatibility list: `djimic detect` enumerates whatever is
+plugged in and reports every usage its descriptor allows, and `djimic probe`
+identifies the button by having you press it. An unlisted DJI mic is a
+two-command question, not an open one.
+
+Worth knowing if you own more than one kit: DJI advertises cross-generation
+pairing, so a Mic 2 or Mic 3 transmitter can pair with a Mic Mini receiver. The
+USB IDs belong to the **receiver**, so such a setup looks like a Mic Mini here
+and the existing rule should apply unchanged. Whether the newer transmitters
+emit the same `0xE9` is unmeasured — `probe` settles it in about ten seconds.
+
+**Non-DJI mics won't be found.** `find_receivers()` filters on DJI's vendor ID
+(`11427`) and accepts any product ID, so every DJI receiver is picked up but
+other brands are skipped. Nothing else in the tool is DJI-specific — the
+descriptor parsing and the Karabiner rule work for any HID consumer control — so
+supporting another brand is a matter of widening that one filter. If you measure
+one, a PR adding its vendor ID is welcome.
+
 ## Commands
 
 | command | what it does |
