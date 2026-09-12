@@ -75,18 +75,33 @@ profile.
 
 ### Handy
 
-Handy stores settings in
-`~/Library/Application Support/com.pais.handy/settings_store.json`. **Quit Handy
-before editing that file** — it holds settings in memory and overwrites the file
-on exit, silently discarding your changes.
+Don't hand-edit the settings file. Run the script — it applies every setting
+below, installs the paste helper, and verifies the result:
 
-Required settings:
+```sh
+./contrib/setup-handy            # configure, then verify
+./contrib/setup-handy --check    # report only, change nothing
+```
+
+It quits Handy before writing (Handy keeps settings in memory and overwrites the
+file on exit, silently discarding anything you changed while it ran), backs the
+file up, relaunches, and re-reads it to confirm. Exit status is 0 only when
+everything checks out, so an agent can branch on it.
+
+What it sets:
 
 | Key | Value | Why |
 | --- | --- | --- |
-| `keyboard_implementation` | `"tauri"` | **Mandatory.** See below. |
+| `keyboard_implementation` | `"tauri"` | **mandatory** — see below |
 | `bindings.transcribe.current_binding` | `"f13"` | what the button sends |
-| `selected_microphone` | `"Wireless Mic Rx"` | else it records the laptop mic |
+| `selected_microphone` | the DJI receiver | else it records the laptop mic |
+| `paste_method` | `"external_script"` | hands the text to the paste helper |
+| `external_script_path` | installed helper | conditional "press enter" submit |
+| `auto_submit` | `false` | else Return gets pressed twice |
+
+It binds plain `transcribe`, not `transcribe_with_post_process`: Handy refuses
+to register the latter while post-processing is off, which kills the button with
+no indication.
 
 **`keyboard_implementation` must be `tauri`.** This is the single most
 important line in this document. Handy's macOS default is `handy_keys`, a
@@ -95,12 +110,24 @@ The shortcut registers successfully, logs no error, and every press does
 nothing at all — no log line, no reaction. `tauri` uses the system's real hotkey
 registration and works immediately. Expect to lose an hour here if you skip it.
 
-After any change, relaunch Handy and confirm in
-`~/Library/Logs/com.pais.handy/handy.log`:
+**How to verify, and what not to look for.** The `tauri` backend writes *no*
+registration line at startup — searching for one and failing to find it proves
+nothing. It logs the hotkey only when the key actually fires:
 
 ```
-Registered ... shortcut: transcribe -> Hotkey { modifiers: Modifiers(0x0), key: Some(F13) }
+tauri global-shortcut event: binding=transcribe, shortcut=F13, state=Pressed
 ```
+
+So silence in `~/Library/Logs/com.pais.handy/handy.log` means "not pressed yet",
+not "broken". `setup-handy --check` encodes that distinction: it reports a
+failure only for an actual `could not register` error.
+
+**Conditional submit.** `contrib/handy-press-enter` receives the transcript and
+presses Return only when the dictation ended with the words "press enter",
+stripping the phrase first. Saying nothing else just pastes. This is a copy of
+Wispr Flow's behaviour; Handy's own `auto_submit` submits after *every*
+dictation, which is why the script turns it off. Use `contrib/handy-timing` to
+see per-stage latency (transcription / LLM / paste) if anything feels slow.
 
 ### Wispr Flow
 
@@ -123,12 +150,22 @@ open at a time** — with both running, both record and the user gets two pastes
 
 ## Verify
 
-Have the user press the button, say a few words, and press again. Do not try to
-verify by synthesizing a keypress: `tauri`/Carbon hotkeys respond only to real
-hardware events, so a synthetic F13 proves nothing either way.
+Run the configuration check first — it is the cheap half and needs no hardware:
+
+```sh
+./contrib/setup-handy --check    # exit 0 when everything is right
+```
+
+Then have the user press the button, say a few words, and press again. Do not
+try to verify by synthesizing a keypress: `tauri`/Carbon hotkeys respond only to
+real hardware events, so a synthetic F13 proves nothing in either direction and
+invites a wrong conclusion. Only the user can press the button.
 
 Check `~/Library/Logs/com.pais.handy/handy.log` for a `Transcription completed`
-line. Silence there means the key never arrived; see failure modes below.
+line. Silence there means the key never arrived; see failure modes below. The
+paste helper keeps its own log at `~/Library/Logs/handy-press-enter.log`, which
+splits the two halves cleanly: an entry there means transcription worked and the
+problem is in the paste, and no entry means it never got that far.
 
 ## Known failure modes
 

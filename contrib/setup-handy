@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Point Handy at the mic button, correctly, in one command.
+
+Handy can be configured by hand, but four of its defaults are wrong for this
+setup and three of them fail *silently* — no error, no log line, the button
+simply does nothing. This applies the working configuration and verifies it.
+
+    ./contrib/setup-handy            # configure and verify
+    ./contrib/setup-handy --check    # report only, change nothing
+
+What it sets, and why:
+
+  keyboard_implementation = tauri
+      The important one. Handy's macOS default, `handy_keys`, is a CGEventTap
+      that never receives keys emitted by Karabiner's virtual keyboard. The
+      shortcut registers, nothing errors, and every press is ignored. `tauri`
+      uses the system's real hotkey registration and works.
+
+  bindings.transcribe = <hotkey>
+      Plain `transcribe`, not `transcribe_with_post_process`: Handy refuses to
+      register the latter while post-processing is off, which kills the button.
+
+  selected_microphone = <the DJI receiver>
+      Otherwise it records the laptop mic while you talk into the clip-on one.
+
+  paste_method = external_script + external_script_path
+      Hands the transcript to contrib/handy-press-enter, which presses Return
+      only when you actually said "press enter".
+
+  auto_submit = false
+      Handy's own auto-submit fires on every paste. With the paste script also
+      pressing Return you would get two.
+
+Handy holds settings in memory and rewrites the file on exit, so it is quit
+before editing and relaunched afterwards. Nothing is written while it runs.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+SETTINGS = os.path.expanduser(
+    "~/Library/Application Support/com.pais.handy/settings_store.json")
+LOG = os.path.expanduser("~/Library/Logs/com.pais.handy/handy.log")
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+OK, BAD, WARN = "[  ok  ]", "[ FAIL ]", "[ warn ]"
+
+
+def say(mark, msg):
+    print(f"{mark} {msg}")
+
+
+def dji_audio_device():
+    """Name of the DJI receiver as CoreAudio sees it, or None."""
+    try:
+        out = subprocess.run(["system_profiler", "SPAudioDataType"],
+                             capture_output=True, text=True).stdout
+    except OSError:
+        return None
+    for m in re.finditer(r"^\s{8}([A-Za-z][^:\n]*):\s*$", out, re.M):
+        name = m.group(1).strip()
+        if "wireless mic" in name.lower() or "dji" in name.lower():
+            return name
+    return None
+
+
+def handy_running():
+    r = subprocess.run(["pgrep", "-f", "Handy.app/Contents/MacOS"],
+                       capture_output=True)
+    return r.returncode == 0
+
+
+def quit_handy():
+    if not handy_running():
+        return
+    subprocess.run(["osascript", "-e", 'quit app "Handy"'],
+                   capture_output=True)
+    for _ in range(20):
+        time.sleep(0.5)
+        if not handy_running():
+            return
+    say(WARN, "Handy did not quit; settings may be overwritten when it does")
+
+
+def launch_handy():
+    subprocess.run(["open", "-a", "Handy"], capture_output=True)
+    time.sleep(6)
+
+
+def unmute():
+    """Handy mutes output while recording; a mid-recording quit strands it."""
+    subprocess.run(["osascript", "-e", "set volume output muted false"],
+                   capture_output=True)
+
+
+def load():
+    with open(SETTINGS) as fh:
+        doc = json.load(fh)
+    return doc, doc.get("settings", doc)
+
+
+def report(s, script_path, hotkey):
+    want = {
+        "keyboard_implementation": "tauri",
+        "selected_microphone": dji_audio_device(),
+        "paste_method": "external_script",
+        "external_script_path": script_path,
+        "auto_submit": False,
+    }
+    bad = 0
+    for key, expect in want.items():
+        got = s.get(key)
+        if expect is None:
+            say(WARN, f"{key}: receiver not plugged in, cannot verify")
+            continue
+        if got == expect:
+            say(OK, f"{key} = {got}")
+        else:
+            say(BAD, f"{key} = {got!r}, expected {expect!r}")
+            bad += 1
+
+    bound = [k for k, v in s.get("bindings", {}).items()
+             if v.get("current_binding") == hotkey]
+    if bound == ["transcribe"]:
+        say(OK, f"{hotkey} -> transcribe")
+    elif bound:
+        say(BAD, f"{hotkey} -> {bound}, expected ['transcribe']")
+        bad += 1
+    else:
+        say(BAD, f"nothing bound to {hotkey}")
+        bad += 1
+    return bad
+
+
+def hotkey_evidence(hotkey):
+    """True if the log shows the hotkey working, False if registration failed.
+
+    The two backends log differently, and the one we want is the quieter of
+    them: `handy_keys` writes a "Registered ... shortcut" line at startup,
+    while `tauri` writes nothing on success and only ever logs the hotkey when
+    it actually fires. So absence of evidence here means "not pressed yet",
+    not "broken" -- which is why None is a distinct answer from False.
+    """
+    try:
+        with open(LOG, errors="replace") as fh:
+            tail = fh.read().splitlines()[-5000:]
+    except OSError:
+        return None
+    key = hotkey.upper()
+    for line in reversed(tail):
+        if key not in line.upper():
+            continue
+        if "global-shortcut event" in line:      # tauri: it fired
+            return True
+        if "Registered" in line and "shortcut" in line:   # handy_keys: startup
+            return True
+        if "could not register" in line or "parse error" in line:
+            return False
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Configure Handy for the mic button.")
+    ap.add_argument("--hotkey", default="f13",
+                    help="what djimic makes the button send (default: f13)")
+    ap.add_argument("--script-dir", default="~/.local/bin",
+                    help="where to install handy-press-enter")
+    ap.add_argument("--check", action="store_true",
+                    help="report current state, change nothing")
+    args = ap.parse_args()
+
+    if not os.path.exists(SETTINGS):
+        say(BAD, "Handy settings not found -- install and launch Handy once first")
+        return 1
+
+    script_dir = os.path.expanduser(args.script_dir)
+    script_path = os.path.join(script_dir, "handy-press-enter")
+
+    if args.check:
+        _, s = load()
+        bad = report(s, script_path, args.hotkey)
+        seen = hotkey_evidence(args.hotkey)
+        if seen is True:
+            say(OK, f"the log shows {args.hotkey} reaching Handy")
+        elif seen is False:
+            say(BAD, f"Handy could not register {args.hotkey} -- quit and reopen it")
+            bad += 1
+        else:
+            say(WARN, f"no {args.hotkey} press in the log yet -- press the button to confirm")
+        return 1 if bad else 0
+
+    mic = dji_audio_device()
+    if not mic:
+        say(WARN, "no DJI receiver found; leaving the microphone setting alone")
+
+    os.makedirs(script_dir, exist_ok=True)
+    src = os.path.join(HERE, "handy-press-enter")
+    if not os.path.exists(src):
+        say(BAD, f"missing {src}")
+        return 1
+    shutil.copy2(src, script_path)
+    os.chmod(script_path, 0o755)
+    say(OK, f"installed {script_path}")
+
+    was_running = handy_running()
+    quit_handy()
+
+    doc, s = load()
+    backup = SETTINGS + ".djimic-backup"
+    shutil.copy2(SETTINGS, backup)
+
+    s["keyboard_implementation"] = "tauri"
+    s["paste_method"] = "external_script"
+    s["external_script_path"] = script_path
+    s["auto_submit"] = False
+    if mic:
+        s["selected_microphone"] = mic
+    s["bindings"]["transcribe"]["current_binding"] = args.hotkey
+    # Never leave both actions on one key -- they would both fire.
+    other = s["bindings"].get("transcribe_with_post_process")
+    if other and other.get("current_binding") == args.hotkey:
+        other["current_binding"] = "alt+shift+space"
+
+    with open(SETTINGS, "w") as fh:
+        json.dump(doc, fh, indent=2)
+    say(OK, f"settings written  (backup: {os.path.basename(backup)})")
+
+    if was_running:
+        launch_handy()
+        unmute()
+
+    _, s = load()
+    bad = report(s, script_path, args.hotkey)
+
+    if was_running:
+        seen = hotkey_evidence(args.hotkey)
+        if seen is False:
+            say(BAD, f"Handy could not register {args.hotkey} -- quit and reopen it")
+            bad += 1
+        # True/None are both fine here: the tauri backend logs nothing until
+        # the key is actually pressed, so silence is expected on a fresh launch.
+    else:
+        say(WARN, "Handy was not running; start it, then re-run with --check")
+
+    print()
+    if bad:
+        say(BAD, "not ready -- see the failures above")
+        return 1
+    say(OK, "ready: press the mic button, talk, press again")
+    print('       end with the words "press enter" to submit as well')
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
