@@ -81,6 +81,73 @@ fit for a **toggle** ("press to start, press again to stop") and a poor fit for
 the mic button to your app's toggle-style shortcut. In Wispr Flow that's
 *Hands-free mode*, not *Push to talk*.
 
+## Submitting the prompt
+
+The button starts and stops dictation. It does not *send*, which is the thing
+you actually want when you're talking to a CLI agent and the prompt has to run.
+What's available depends on the dictation app, so here is what each one really
+does.
+
+**Wispr Flow: say "press enter" as the last words of the utterance.** The
+phrase is stripped from the text and Enter is simulated once the paste lands.
+The first time you use it you get a notification asking to turn the feature on;
+after that it is `pressEnterCommandEnabled` in
+`~/Library/Application Support/Wispr Flow/config.json`.
+
+**Wispr Flow has no always-submit setting.** Measured against 1.6.827, the
+whole feature is one regex
+
+```
+/([.!?;])?[\s]*\bpress enter\s*([.!?,;:-]*)\s*$/i
+```
+
+matched against the formatted text, falling back to the raw ASR text when the
+LLM strips the phrase during formatting. Nothing else in the app sets
+`shouldPressEnterAfterPaste`.
+
+The `$` is the part that bites. The phrase has to end the utterance, so
+anything arriving after it kills the match — and you get no Enter *and* the
+words "press enter" left in your text. Another voice in the room is enough: one
+observed failure was a bystander saying "under" as the dictation closed,
+yielding "…press enter under", which matches nothing.
+
+**Handy: Settings → Advanced → Auto Submit.** Off / Enter / Ctrl+Enter /
+Cmd+Enter, sent after every paste with no phrase involved — see
+`should_send_auto_submit` in `src-tauri/src/clipboard.rs`, measured against
+0.9.6. The only condition is that the paste method isn't `None`. If you want
+the mic button to submit every time without thinking about it, this is the one
+that does it, and it needs no daemon and no accessibility grant of ours: bind
+Handy to `f13` and run `djimic install --hotkey f13`.
+
+## Open mic
+
+**None of them listen on their own.** Every one needs a press to start.
+
+- **Wispr Flow** tracks silence only to diagnose a dead-microphone bug — it
+  logs `Audio silence bug detected` and never stops the recording on its own.
+  "Hey Flow" is not a wake word: it is a phrase matched *inside* an
+  already-running dictation to route that utterance into Command Mode.
+- **Handy** runs Silero VAD, but the VAD filters silence out of the recording
+  rather than ending it; `VadPolicy` is `Disabled` / `Offline` / `Streaming`,
+  all frame-filtering profiles. `always_on_microphone` is "keep microphone
+  active for faster response" — it holds the audio stream open to cut startup
+  latency, not hands-free capture. All three activation modes (`Toggle`,
+  `PushToTalk`, `HoldOrToggle`) are key-driven.
+- **superwhisper** documents its auto-send as "Hold Shift to Auto-Send", a
+  modifier you have to hold, so its submit step isn't touch-free either.
+  (Secondhand write-ups describe a configurable auto-stop-after-silence; that
+  is not in the settings docs and is unverified here. Unlike the two findings
+  above, this one is read, not measured.)
+
+For this tool that gap matters less than it looks, because the transmitter
+clips to your shirt. Pressing *it* is not touching the computer, so a worn
+button plus Handy's Auto Submit is hands-free end to end with no phrase to
+mishear.
+
+Handy is the one worth watching: it already has both halves — a VAD that knows
+when you stopped talking, and an unconditional submit. "End the recording after
+N seconds of silence" is the only missing piece.
+
 ## What it writes
 
 Exactly one thing: a complex modification in `~/.config/karabiner/karabiner.json`,
