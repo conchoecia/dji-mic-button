@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 
@@ -215,12 +216,35 @@ def write_config(cfg, path):
         fh.write("\n")
 
 
-def lint_config(path):
+def lint_config(cfg):
+    """Lint the rules Karabiner will parse, in the shape the linter expects.
+
+    `--lint-complex-modifications` wants a complex-modifications *asset* file
+    -- {"title": ..., "rules": [...]}, the shape of the files under
+    assets/complex_modifications -- not a whole karabiner.json. Handed the
+    latter it treats the top-level object as a rule, reports `manipulators` is
+    missing, and fails for any config at all. That went unnoticed while
+    karabiner_cli was absent, because the lint was then skipped entirely; a
+    Karabiner update that installs the CLI turns it into a total failure.
+    """
     if not os.path.exists(KARABINER_CLI):
         return True, "karabiner_cli not present; lint skipped"
-    r = subprocess.run([KARABINER_CLI, "--lint-complex-modifications", path],
-                       capture_output=True, text=True)
-    return r.returncode == 0, (r.stdout + r.stderr).strip()
+    rules = []
+    for prof in cfg.get("profiles", []):
+        rules.extend(prof.get("complex_modifications", {}).get("rules", []))
+    if not rules:
+        return True, "no complex modifications to lint"
+
+    fd, tmp = tempfile.mkstemp(prefix=f"{RULE_TAG}-lint-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"title": f"{RULE_TAG} lint", "rules": rules}, fh)
+        r = subprocess.run([KARABINER_CLI, "--lint-complex-modifications", tmp],
+                           capture_output=True, text=True)
+        msg = (r.stdout + r.stderr).strip().replace(tmp, "<rules>")
+        return r.returncode == 0, msg
+    finally:
+        os.unlink(tmp)
 
 
 def log_errors_since(when, wait=2.0):
@@ -314,7 +338,7 @@ def commit(cfg, path, note):
     before = datetime.now().replace(microsecond=0)
     write_config(cfg, path)
 
-    good, msg = lint_config(path)
+    good, msg = lint_config(cfg)
     if not good:
         shutil.copy2(backup, path)
         say(BAD, f"Config rejected by lint, rolled back:\n      {msg}")
